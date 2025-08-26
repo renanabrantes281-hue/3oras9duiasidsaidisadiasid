@@ -2,6 +2,7 @@ require('dotenv').config(); // Carrega o .env
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
+const WebSocket = require("ws");
 
 // ⚙️ Configurações
 const PORT = process.env.PORT || 5000;
@@ -69,10 +70,10 @@ app.get("/messages", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando em http://127.0.0.1:${PORT}`);
-  startCollector();
+  startCollector(); // inicia o gateway
 });
 
-// ================== Collector ==================
+// ================== Parser ==================
 function parseMoneyPerSec(raw) {
   if (!raw) return 0;
   let s = raw.replace(/\*/g, "").replace(/\s+/g, "");
@@ -126,50 +127,67 @@ function parseEmbedFields(msg) {
   return result;
 }
 
-async function pollNewMessages() {
-  let lastId = null;
-  while (true) {
-    try {
-      let url = `https://discord.com/api/v9/channels/${CHANNEL_ID}/messages?limit=50`;
-      if (lastId) url += `&after=${lastId}`;
-
-      let r = await axios.get(url, {
-        headers: { Authorization: DISCORD_TOKEN, "User-Agent": "DiscordBot (example, v0.1)" },
-      });
-
-      if (r.status === 200 && r.data.length > 0) {
-        let msgs = r.data.reverse();
-        for (let m of msgs) {
-          let parsed = parseEmbedFields(m);
-          if (!parsed.jobId && !parsed.serverName) {
-            lastId = m.id || lastId;
-            continue;
-          }
-          let payload = {
-            id: m.id,
-            author: m.author?.username || "Unknown",
-            serverName: parsed.serverName || "",
-            moneyPerSec: parsed.moneyPerSec || 0,
-            players: parsed.players || "",
-            jobId: parsed.jobId || "",
-          };
-          try {
-            await axios.post(`http://127.0.0.1:${PORT}/receive`, payload, { timeout: 6000 });
-            console.log("Enviado ao localhost:", payload);
-          } catch (err) {
-            console.error("Falha ao enviar payload:", payload);
-          }
-          lastId = m.id || lastId;
-        }
-      }
-    } catch (e) {
-      console.error("Erro no poll:", e.message);
-    }
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-}
-
+// ================== Collector via Gateway ==================
 function startCollector() {
-  console.log("Collector rodando (polling incremental). Ctrl+C para sair.");
-  pollNewMessages();
+  console.log("Collector rodando (Gateway WebSocket, instantâneo). Ctrl+C para sair.");
+
+  const ws = new WebSocket("wss://gateway.discord.gg/?v=9&encoding=json");
+  let heartbeat;
+
+  ws.on("open", () => console.log("Conectado ao Gateway do Discord"));
+
+  ws.on("message", async (raw) => {
+    let payload = JSON.parse(raw);
+    const { t, op, d } = payload;
+
+    // 💓 Heartbeat
+    if (op === 10) {
+      clearInterval(heartbeat);
+      heartbeat = setInterval(() => {
+        ws.send(JSON.stringify({ op: 1, d: null }));
+      }, d.heartbeat_interval);
+
+      // Identificação
+      ws.send(JSON.stringify({
+        op: 2,
+        d: {
+          token: DISCORD_TOKEN,
+          intents: 513, // GUILD_MESSAGES + DIRECT_MESSAGES
+          properties: { $os: "linux", $browser: "node", $device: "node" }
+        }
+      }));
+    }
+
+    // 📩 Nova mensagem
+    if (t === "MESSAGE_CREATE" && d.channel_id === CHANNEL_ID) {
+      const parsed = parseEmbedFields(d);
+      if (!parsed.jobId && !parsed.serverName) return; // ignora irrelevantes
+
+      const payloadToSend = {
+        id: d.id,
+        author: d.author?.username || "Unknown",
+        serverName: parsed.serverName || "",
+        moneyPerSec: parsed.moneyPerSec || 0,
+        players: parsed.players || "",
+        jobId: parsed.jobId || ""
+      };
+
+      try {
+        await axios.post(`http://127.0.0.1:${PORT}/receive`, payloadToSend, { timeout: 6000 });
+        console.log("Enviado instantâneo:", payloadToSend);
+      } catch (err) {
+        console.error("Erro ao enviar:", err.message);
+      }
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("Gateway desconectado, tentando reconectar em 5s...");
+    clearInterval(heartbeat);
+    setTimeout(startCollector, 5000);
+  });
+
+  ws.on("error", (err) => {
+    console.error("Erro no WebSocket:", err.message);
+  });
 }
